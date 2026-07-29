@@ -54,13 +54,17 @@ func (k *Cache) WithNumBlocks(num int) *Cache {
 	return k
 }
 
-func (k *Cache) InitializePools(orderedScopes []string, numKVHeads, headDim int, dtype dtypes.DType) Pools {
+func (k *Cache) InitializePools(orderedScopes []string, numKVHeads, headDim int, dtype dtypes.DType) (Pools, error) {
+	if len(orderedScopes) == 0 || headDim <= 0 || numKVHeads <= 0 {
+		return nil, errors.New("ordered scopes must be non-empty, and headDim and numKVHeads must be positive")
+	}
+
 	pools := make([]*tensors.Tensor, len(orderedScopes))
 	shape := shapes.Make(dtype, 2, k.NumBlocks, k.BlockSize, numKVHeads, headDim)
 	for i := range orderedScopes {
 		pools[i] = tensors.FromShape(shape)
 	}
-	return pools
+	return pools, nil
 }
 
 func (k *Cache) InitializeAllocator() *Allocator {
@@ -76,17 +80,19 @@ func (k *Cache) InitializeAllocator() *Allocator {
 // idempotent: only adds unallocated blocks
 func (k *Cache) Allocate(a *Allocator, reqId, seqLen int) error {
 	need := k.numAllocateBlocks(seqLen)
-	table, ok := a.Table[reqId]
 
-	if !ok {
-		a.Table[reqId] = &RequestState{Blocks: make([]int, 0, need)}
-		table = a.Table[reqId]
-	} else {
+	table, ok := a.Table[reqId]
+	if ok {
 		need -= len(table.Blocks)
 	}
 
 	if need > len(a.FreeBlocks) {
 		return errors.Errorf("need %d blocks > %d free blocks", need, len(a.FreeBlocks))
+	}
+
+	if !ok {
+		a.Table[reqId] = &RequestState{}
+		table = a.Table[reqId]
 	}
 
 	for range need {
@@ -120,7 +126,7 @@ func (k *Cache) Free(a *Allocator, reqId int) error {
 	return nil
 }
 
-func (k *Cache) Update(a *Allocator, cache Nodes, nextK, nextV *Node, layer_idx, reqId int) error {
+func (k *Cache) Update(a *Allocator, cache Nodes, nextK, nextV *Node, layerIdx, reqId int) error {
 	table, ok := a.Table[reqId]
 	if !ok {
 		return errors.Errorf("request %d not found in allocator", reqId)
@@ -144,8 +150,11 @@ func (k *Cache) Update(a *Allocator, cache Nodes, nextK, nextV *Node, layer_idx,
 
 	// [2, nBlocks, blockSize, H, D]
 	// 0/1, blockIdx, offsetIdx, nKVHeads, dim
-	H := cache[layer_idx].Shape().Dimensions[3]
-	D := cache[layer_idx].Shape().Dimensions[4]
+	if layerIdx >= len(cache) {
+		return errors.Errorf("layer index %d >= len(cache)", layerIdx)
+	}
+	H := cache[layerIdx].Shape().Dimensions[3]
+	D := cache[layerIdx].Shape().Dimensions[4]
 
 	// Normalize to [B, S, H, D], right now designing for S == 1
 	// What if S == H?
@@ -164,7 +173,7 @@ func (k *Cache) Update(a *Allocator, cache Nodes, nextK, nextV *Node, layer_idx,
 	keyIdx := Const(g, int32(0))
 	valIdx := Const(g, int32(1))
 
-	offsetIdx := Const(g, offset)
+	offsetIdx := Const(g, int32(offset))
 	headsIdx := Const(g, int32(0))
 	dimIdx := Const(g, int32(0))
 
@@ -178,12 +187,67 @@ func (k *Cache) Update(a *Allocator, cache Nodes, nextK, nextV *Node, layer_idx,
 		table.Blocks = append(table.Blocks, block)
 		a.FreeBlocks = a.FreeBlocks[:n]
 	}
-	physIdx := Const(g, table.Blocks[logical])
+	physIdx := Const(g, int32(table.Blocks[logical]))
 
-	cache[layer_idx] = DynamicUpdateSlice(cache[layer_idx], nextK, []*Node{keyIdx, physIdx, offsetIdx, headsIdx, dimIdx})
-	cache[layer_idx] = DynamicUpdateSlice(cache[layer_idx], nextV, []*Node{valIdx, physIdx, offsetIdx, headsIdx, dimIdx})
-
-	table.NextPosition++
+	cache[layerIdx] = DynamicUpdateSlice(cache[layerIdx], nextK, []*Node{keyIdx, physIdx, offsetIdx, headsIdx, dimIdx})
+	cache[layerIdx] = DynamicUpdateSlice(cache[layerIdx], nextV, []*Node{valIdx, physIdx, offsetIdx, headsIdx, dimIdx})
 
 	return nil
+}
+
+func (k *Cache) Advance(a *Allocator, reqId int) error {
+	table, ok := a.Table[reqId]
+	if !ok {
+		return errors.Errorf("request %d not found in allocator", reqId)
+	}
+	table.NextPosition++
+	return nil
+}
+
+// Returns in [B, S, H, D]
+func (k *Cache) Get(a *Allocator, cache Nodes, layerIdx, reqId int) (*Node, *Node, error) {
+	table, ok := a.Table[reqId]
+	if !ok {
+		return nil, nil, errors.Errorf("request %d not found in allocator", reqId)
+	}
+
+	nextPos := table.NextPosition
+	if nextPos > len(table.Blocks)*k.BlockSize {
+		panic(fmt.Sprintf("pagedkv.Get: next position %d > allocated slots == %d", nextPos, len(table.Blocks)*k.BlockSize))
+	}
+	if nextPos == 0 || len(table.Blocks) == 0 {
+		return nil, nil, errors.Errorf("request %d is empty", reqId)
+	}
+
+	if layerIdx >= len(cache) {
+		return nil, nil, errors.Errorf("layerIdx %d >= len(cache)", layerIdx)
+	}
+	pool := cache[layerIdx]
+
+	g := pool.Graph()
+
+	blocksInt32 := make([]int32, len(table.Blocks))
+	for i, num := range table.Blocks {
+		blocksInt32[i] = int32(num)
+	}
+
+	// [nBlocks, 1]
+	blocks := Reshape(Const(g, blocksInt32), len(blocksInt32), 1)
+
+	// [1, nBlocks, blockSize, H, D]
+	K, V := Slice(pool, AxisElem(0)), Slice(pool, AxisElem(1))
+	// [nBlocks, 1, 1, blockSize, H, D]
+	K, V = GatherSlices(K, []int{1}, blocks, []int{1}, false), GatherSlices(V, []int{1}, blocks, []int{1}, false)
+
+	// [nBlocks, blockSize, H, D]
+	K, V = Squeeze(K, 1, 2), Squeeze(V, 1, 2)
+
+	reshapeDims := []int{1, K.Shape().Dimensions[0] * K.Shape().Dimensions[1], K.Shape().Dimensions[2], K.Shape().Dimensions[3]}
+	// [1, nBlocks * blockSize, H, D]
+	K, V = Reshape(K, reshapeDims...), Reshape(V, reshapeDims...)
+
+	// [1, S, H, D]
+	K, V = Slice(K, AxisRange(), AxisRangeFromStart(nextPos)), Slice(V, AxisRange(), AxisRangeFromStart(nextPos))
+
+	return K, V, nil
 }
