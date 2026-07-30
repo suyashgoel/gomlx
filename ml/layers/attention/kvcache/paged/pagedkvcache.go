@@ -55,7 +55,7 @@ func (k *Cache) WithNumBlocks(num int) *Cache {
 }
 
 func (k *Cache) InitializePools(nLayers, numKVHeads, headDim int, dtype dtypes.DType) (Pools, error) {
-	if nLayers == 0 || headDim <= 0 || numKVHeads <= 0 {
+	if nLayers <= 0 || headDim <= 0 || numKVHeads <= 0 {
 		return nil, errors.New("nLayers, headDim and numKVHeads must be positive")
 	}
 
@@ -148,12 +148,14 @@ func (k *Cache) NextPhysicalSlot(a *Allocator, reqId int) (int32, error) {
 	return int32(table.Blocks[logical]*k.BlockSize + offset), nil
 }
 
-func (k *Cache) Update(a *Allocator, cache Nodes, nextK, nextV *Node, layerIdx int, physicalSlot *Node) error {
+func (k *Cache) Update(cache Nodes, nextK, nextV *Node, layerIdx int, physicalSlot *Node) error {
 	// [2, nBlocks, blockSize, H, D]
 	// 0/1, blockIdx, offsetIdx, nKVHeads, dim
 	if layerIdx >= len(cache) {
 		return errors.Errorf("layer index %d >= cache length %d", layerIdx, len(cache))
 	}
+	pool := cache[layerIdx]
+
 	H := cache[layerIdx].Shape().Dimensions[3]
 	D := cache[layerIdx].Shape().Dimensions[4]
 
@@ -164,9 +166,9 @@ func (k *Cache) Update(a *Allocator, cache Nodes, nextK, nextV *Node, layerIdx i
 		nextV = Transpose(nextV, 1, 2)
 	}
 
-	// [1, 1, 1, H, D]
-	nextK = Reshape(nextK, 1, 1, 1, H, D)
-	nextV = Reshape(nextV, 1, 1, 1, H, D)
+	// [1, 1, H, D]
+	nextK = Reshape(nextK, 1, 1, H, D)
+	nextV = Reshape(nextV, 1, 1, H, D)
 
 	g := nextK.Graph()
 
@@ -174,8 +176,6 @@ func (k *Cache) Update(a *Allocator, cache Nodes, nextK, nextV *Node, layerIdx i
 	valIdx := Const(g, int32(1))
 	headsIdx := Const(g, int32(0))
 	dimIdx := Const(g, int32(0))
-
-	pool := cache[layerIdx]
 
 	origDims := pool.Shape().Dimensions
 	transformedDims := []int{origDims[0], origDims[1] * origDims[2], origDims[3], origDims[4]}
@@ -202,49 +202,32 @@ func (k *Cache) Advance(a *Allocator, reqId int) error {
 }
 
 // Returns in [B, S, H, D]
-func (k *Cache) Get(a *Allocator, cache Nodes, layerIdx, reqId int) (*Node, *Node, error) {
-	table, ok := a.Table[reqId]
-	if !ok {
-		return nil, nil, errors.Errorf("request %d not found in allocator", reqId)
-	}
-
-	nextPos := table.NextPosition
-	if nextPos > len(table.Blocks)*k.BlockSize {
-		panic(fmt.Sprintf("pagedkv.Get: next position %d > allocated slots == %d", nextPos, len(table.Blocks)*k.BlockSize))
-	}
-	if nextPos == 0 || len(table.Blocks) == 0 {
-		return nil, nil, errors.Errorf("request %d is empty", reqId)
-	}
-
+func (k *Cache) Get(cache Nodes, blockTable *Node, layerIdx int) (*Node, *Node, error) {
 	if layerIdx >= len(cache) {
-		return nil, nil, errors.Errorf("layerIdx %d >= len(cache)", layerIdx)
+		return nil, nil, errors.Errorf("layer index %d >= cache length %d", layerIdx, len(cache))
 	}
 	pool := cache[layerIdx]
 
-	g := pool.Graph()
-
-	blocksInt32 := make([]int32, len(table.Blocks))
-	for i, num := range table.Blocks {
-		blocksInt32[i] = int32(num)
-	}
-
-	// [nBlocks, 1]
-	blocks := Reshape(Const(g, blocksInt32), len(blocksInt32), 1)
-
-	// [1, nBlocks, blockSize, H, D]
-	K, V := Slice(pool, AxisElem(0)), Slice(pool, AxisElem(1))
-	// [nBlocks, 1, 1, blockSize, H, D]
-	K, V = GatherSlices(K, []int{1}, blocks, []int{1}, false), GatherSlices(V, []int{1}, blocks, []int{1}, false)
-
 	// [nBlocks, blockSize, H, D]
-	K, V = Squeeze(K, 1, 2), Squeeze(V, 1, 2)
+	K, V := Squeeze(Slice(pool, AxisElem(0)), 0), Squeeze(Slice(pool, AxisElem(1)), 0)
 
-	reshapeDims := []int{1, K.Shape().Dimensions[0] * K.Shape().Dimensions[1], K.Shape().Dimensions[2], K.Shape().Dimensions[3]}
-	// [1, nBlocks * blockSize, H, D]
-	K, V = Reshape(K, reshapeDims...), Reshape(V, reshapeDims...)
+	batchSize := blockTable.Shape().Dimensions[0]
+	maxBlocks := blockTable.Shape().Dimensions[1]
 
-	// [1, S, H, D]
-	K, V = Slice(K, AxisRange(), AxisRangeFromStart(nextPos)), Slice(V, AxisRange(), AxisRangeFromStart(nextPos))
+	// [B, maxBlocks, 1]
+	blockTable = Reshape(blockTable, batchSize, maxBlocks, 1)
+
+	// [B, maxBlocks, 1, blockSize, H, D]
+	K, V = GatherSlices(K, []int{0}, blockTable, []int{1}, false), GatherSlices(V, []int{0}, blockTable, []int{1}, false)
+
+	// [B, maxBlocks, blockSize, H, D]
+	K, V = Squeeze(K, 2), Squeeze(V, 2)
+
+	origDims := K.Shape().Dimensions
+	dims := []int{origDims[0], origDims[1] * origDims[2], origDims[3], origDims[4]}
+
+	// [B, maxBlocks * blockSize, H, D]
+	K, V = Reshape(K, dims...), Reshape(V, dims...)
 
 	return K, V, nil
 }
