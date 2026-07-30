@@ -54,14 +54,14 @@ func (k *Cache) WithNumBlocks(num int) *Cache {
 	return k
 }
 
-func (k *Cache) InitializePools(orderedScopes []string, numKVHeads, headDim int, dtype dtypes.DType) (Pools, error) {
-	if len(orderedScopes) == 0 || headDim <= 0 || numKVHeads <= 0 {
-		return nil, errors.New("ordered scopes must be non-empty, and headDim and numKVHeads must be positive")
+func (k *Cache) InitializePools(nLayers, numKVHeads, headDim int, dtype dtypes.DType) (Pools, error) {
+	if nLayers == 0 || headDim <= 0 || numKVHeads <= 0 {
+		return nil, errors.New("nLayers, headDim and numKVHeads must be positive")
 	}
 
-	pools := make([]*tensors.Tensor, len(orderedScopes))
+	pools := make([]*tensors.Tensor, nLayers)
 	shape := shapes.Make(dtype, 2, k.NumBlocks, k.BlockSize, numKVHeads, headDim)
-	for i := range orderedScopes {
+	for i := range nLayers {
 		pools[i] = tensors.FromShape(shape)
 	}
 	return pools, nil
@@ -126,32 +126,33 @@ func (k *Cache) Free(a *Allocator, reqId int) error {
 	return nil
 }
 
-func (k *Cache) Update(a *Allocator, cache Nodes, nextK, nextV *Node, layerIdx, reqId int) error {
+func (k *Cache) NextPhysicalSlot(a *Allocator, reqId int) (int32, error) {
 	table, ok := a.Table[reqId]
 	if !ok {
-		return errors.Errorf("request %d not found in allocator", reqId)
+		return 0, errors.Errorf("request %d not found in allocator", reqId)
 	}
 
 	nextPosition := table.NextPosition
-	blocks := table.Blocks
-
 	logical := nextPosition / k.BlockSize
 	offset := nextPosition % k.BlockSize
 
+	blocks := table.Blocks
+
 	if logical < 0 {
-		panic(fmt.Sprintf("pagedkv.Update: logical block %d < 0", logical))
+		panic(fmt.Sprintf("pagedkv.NextPhysicalSlot: logical block %d < 0", logical))
 	}
-	if logical == len(blocks) && offset != 0 {
-		panic(fmt.Sprintf("pagedkv.Update: logical block %d ==  len(blocks) and offset %d != 0", logical, offset))
-	}
-	if logical > len(blocks) {
-		panic(fmt.Sprintf("pagedkv.Update: logical block %d > len(blocks) == %d", logical, len(blocks)))
+	if logical >= len(blocks) {
+		panic(fmt.Sprintf("pagedkv.NextPhysicalSlot: logical block %d >= len(blocks) == %d", logical, len(blocks)))
 	}
 
+	return int32(table.Blocks[logical]*k.BlockSize + offset), nil
+}
+
+func (k *Cache) Update(a *Allocator, cache Nodes, nextK, nextV *Node, layerIdx int, physicalSlot *Node) error {
 	// [2, nBlocks, blockSize, H, D]
 	// 0/1, blockIdx, offsetIdx, nKVHeads, dim
 	if layerIdx >= len(cache) {
-		return errors.Errorf("layer index %d >= len(cache)", layerIdx)
+		return errors.Errorf("layer index %d >= cache length %d", layerIdx, len(cache))
 	}
 	H := cache[layerIdx].Shape().Dimensions[3]
 	D := cache[layerIdx].Shape().Dimensions[4]
@@ -169,32 +170,28 @@ func (k *Cache) Update(a *Allocator, cache Nodes, nextK, nextV *Node, layerIdx, 
 
 	g := nextK.Graph()
 
-	// key is first dimension, value is second dimension
 	keyIdx := Const(g, int32(0))
 	valIdx := Const(g, int32(1))
-
-	offsetIdx := Const(g, int32(offset))
 	headsIdx := Const(g, int32(0))
 	dimIdx := Const(g, int32(0))
 
-	if logical == len(blocks) {
-		if len(a.FreeBlocks) == 0 {
-			return errors.New("no free blocks available")
-		}
+	pool := cache[layerIdx]
 
-		n := len(a.FreeBlocks) - 1
-		block := a.FreeBlocks[n]
-		table.Blocks = append(table.Blocks, block)
-		a.FreeBlocks = a.FreeBlocks[:n]
-	}
-	physIdx := Const(g, int32(table.Blocks[logical]))
+	origDims := pool.Shape().Dimensions
+	transformedDims := []int{origDims[0], origDims[1] * origDims[2], origDims[3], origDims[4]}
+	// [2, nBlocks * blockSize, H, D]
+	pool = Reshape(pool, transformedDims...)
 
-	cache[layerIdx] = DynamicUpdateSlice(cache[layerIdx], nextK, []*Node{keyIdx, physIdx, offsetIdx, headsIdx, dimIdx})
-	cache[layerIdx] = DynamicUpdateSlice(cache[layerIdx], nextV, []*Node{valIdx, physIdx, offsetIdx, headsIdx, dimIdx})
+	pool = DynamicUpdateSlice(pool, nextK, []*Node{keyIdx, physicalSlot, headsIdx, dimIdx})
+	pool = DynamicUpdateSlice(pool, nextV, []*Node{valIdx, physicalSlot, headsIdx, dimIdx})
+
+	pool = Reshape(pool, origDims...)
+	cache[layerIdx] = pool
 
 	return nil
 }
 
+// Advance cursor
 func (k *Cache) Advance(a *Allocator, reqId int) error {
 	table, ok := a.Table[reqId]
 	if !ok {
