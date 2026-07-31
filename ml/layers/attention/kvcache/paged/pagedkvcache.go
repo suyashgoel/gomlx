@@ -9,6 +9,7 @@ import (
 	"github.com/gomlx/compute/shapes"
 	. "github.com/gomlx/gomlx/core/graph"
 	"github.com/gomlx/gomlx/core/tensors"
+	"github.com/gomlx/gomlx/support/xslices"
 	"github.com/pkg/errors"
 )
 
@@ -151,6 +152,12 @@ func (k *Cache) NextPhysicalSlot(a *Allocator, reqId int) (int32, error) {
 func (k *Cache) Update(cache Nodes, nextK, nextV *Node, layerIdx int, physicalSlot *Node) error {
 	// [2, nBlocks, blockSize, H, D]
 	// 0/1, blockIdx, offsetIdx, nKVHeads, dim
+	if !nextK.Shape().Equal(nextV.Shape()) {
+		return errors.Errorf("nextK dims %v != nextV dims %v", nextK.Shape().Dimensions, nextV.Shape().Dimensions)
+	}
+	if nextK.Shape().Dimensions[0] != physicalSlot.Shape().Dimensions[0] || nextV.Shape().Dimensions[0] != physicalSlot.Shape().Dimensions[0] {
+		return errors.Errorf("batch size mismatch: nextK B == %d, nextV B == %d, physicalSlot B == %d", nextK.Shape().Dimensions[0], nextV.Shape().Dimensions[0], physicalSlot.Shape().Dimensions[0])
+	}
 	if layerIdx >= len(cache) {
 		return errors.Errorf("layer index %d >= cache length %d", layerIdx, len(cache))
 	}
@@ -230,4 +237,23 @@ func (k *Cache) Get(cache Nodes, blockTable *Node, layerIdx int) (*Node, *Node, 
 	K, V = Reshape(K, dims...), Reshape(V, dims...)
 
 	return K, V, nil
+}
+
+func BuildBlockTableTensor(a *Allocator) *tensors.Tensor {
+	maxBlocks := 0
+	numReq := len(a.Table)
+	for _, req := range a.Table {
+		if len(req.Blocks) > maxBlocks {
+			maxBlocks = 0
+		}
+	}
+
+	btSlice := make([][]int32, numReq)
+	for i, req := range a.Table {
+		btSlice[i] = make([]int32, maxBlocks)
+		copy(btSlice[i], xslices.Map(req.Blocks, func(x int) int32 { return int32(x) }))
+	}
+
+	bt := tensors.FromValue(btSlice)
+	return bt
 }
